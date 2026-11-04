@@ -13,13 +13,20 @@ for the Herdr TUI. Both read the same config file.
 
 ## Install
 
-Needs Rust (1.96+), Zig (for libghostty-vt, fetched at build time) and herdr-app 0.1.12+
-with herdr-core 0.1.17+. macOS (Apple Silicon) is tested; Linux should work.
+Needs Rust (1.96+), Zig 0.17.x (to build libghostty-vt, fetched at build time) and
+herdr-app 0.1.12+ with herdr-core 0.1.17+. macOS (Apple Silicon) is tested; Linux
+should work.
+
+Use the repo's `mise.toml` to select the build tools without changing global defaults:
 
 ```sh
-./scripts/install.sh          # build, put the binary in mod/bin/, herdr-app check mod
-./scripts/install.sh --link   # also link ~/.config/herdr-app/mods/pluck -> mod/
+mise trust
+mise install
+mise run install             # build, install in mod/bin/, check mod
+mise run install -- --link   # also link ~/.config/herdr-app/mods/pluck -> mod/
 ```
+
+With mise activated in your shell, you can run `./scripts/install.sh` directly.
 
 `--link` replaces an existing *symlink* at `mods/pluck` (for example the old
 herdr-pluck mod) and refuses to touch a real folder. Skip it if your dotfiles own the link.
@@ -132,8 +139,21 @@ pattern_files = [".herdr-pluck.toml"] # searched from the pane's folder up to th
 
 ## Development
 
-See `AGENTS.md` and the verify skill in `.agents/skills/verify-herdr-app-pluck/`.
+Run repo workflows with mise; it selects the pinned Rust and Zig versions even
+without shell activation. Run `mise trust` and `mise install` once after cloning.
 
-```sh
-cargo fmt --all -- --check && cargo clippy --all-targets && cargo test
-```
+| Command | Purpose |
+|---|---|
+| `mise run check` | Check formatting, run Clippy, then run tests; stop on the first failure |
+| `mise run build` | Build the release binary in `target/release/` |
+| `mise run install` | Build, copy the binary into `mod/bin/`, and validate the mod |
+| `mise run mod-check` | Validate `mod/` with `herdr-app check` without rebuilding |
+
+`mise tasks` lists the available tasks. The install task delegates to
+`scripts/install.sh`; pass its options after `--`, e.g. `mise run install -- --link`.
+Individual Cargo commands still work with mise activated, or through
+`mise exec -- cargo <command>`.
+
+Live verification stays separate: it starts an app window and can change the clipboard.
+See `AGENTS.md` and `.agents/skills/verify-herdr-app-pluck/SKILL.md` for the `pv`
+helper, safety rules, and evidence requirements.

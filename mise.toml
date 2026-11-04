@@ -1,0 +1,23 @@
+[tools]
+rust = "1.99.1"
+zig = "0.17.1"
+
+[tasks.check]
+description = "Check formatting, lint, and run tests"
+run = [
+  "cargo fmt --all -- --check",
+  "cargo clippy --all-targets",
+  "cargo test",
+]
+
+[tasks.build]
+description = "Build the release binary"
+run = "cargo build --release"
+
+[tasks.install]
+description = "Build, install, and validate the mod"
+run = "./scripts/install.sh"
+
+[tasks.mod-check]
+description = "Validate the Herdr mod"
+run = "herdr-app check mod/"
