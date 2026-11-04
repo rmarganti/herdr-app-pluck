@@ -1,0 +1,5 @@
+# Broken on purpose: unknown key.
+foo = 1
+[[patterns]]
+name = "x"
+regex = "x"

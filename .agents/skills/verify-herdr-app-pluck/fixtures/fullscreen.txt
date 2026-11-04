@@ -1,0 +1,6 @@
+Fixture for full-screen programs (nvim, less).
+url      https://example.com/docs/getting-started
+path     src/picker/session.rs
+sha      1a63023f
+ip       192.168.40.12
+end-of-fixture

@@ -1,0 +1,607 @@
+#!/usr/bin/env bash
+# pv: drive herdr-app-pluck end to end in a real Herdr app window.
+#
+# Two modes:
+#   pv up            a private window (own app home, own herdr-core session). Needs the
+#                    window uncovered on screen: a covered macOS window doesn't draw.
+#   pv up --real     the person's own window, with their permission. pv works only in a
+#                    "pluck-test" tab it creates and closes, links this checkout's mod as
+#                    mods/pluck-dev (a mod pane in that tab), and restores the clipboard,
+#                    app zoom and the tab that was shown.
+#
+#   pv doctor                   read-only checks
+#   pv seed <fixture> | seed --cmd <argv...> [--wait TEXT]
+#                               new test tab running a fixture (or a program); it's the source
+#   pv split <fixture> [right|down]   split the source; the new pane is the source
+#   pv zoom                     zoom the source pane (again: unzoom; private mode only)
+#   pv appzoom in|out|reset     app zoom (down undoes it)
+#   pv config <fixture.toml>    the picker's global config (default: global-config.toml)
+#   pv dev '<json>'             merge into the test-hook file (null removes a key)
+#   pv calibrate                find the source pane's cell area in screenshots
+#   pv invoke copy|open         press the key: herdr-app do <mod>.<action>
+#   pv select <keys...>         hc keys into the picker; evidence of what happened
+#   pv exact <fixture>|KEEP|--cmd argv... [--dim] [--hints]   exactness harness
+#   pv shot <name>              screenshot into evidence
+#   pv status                   herdr-app status
+#   pv down                     clean up, restore, keep evidence
+#
+# Bash 3.2 compatible (macOS /bin/bash).
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/../../../.." && pwd)
+SKILL="$ROOT/.agents/skills/verify-herdr-app-pluck"
+FIXTURES="$SKILL/fixtures"
+VROOT="$ROOT/target/verify"
+CUR="$VROOT/current"
+PNGDIFF="$ROOT/target/release/examples/pngdiff"
+TMP_BASE="${TMPDIR:-/tmp}"
+TMP_BASE="${TMP_BASE%/}"
+REAL_HOME="$HOME/.config/herdr-app"
+DEV_MOD=pluck-dev
+STATE_VARS="MODE RUN APP_HOME SESSION SPACE MODNAME DEVFILE ORIG_TAB ZOOM_DELTA TAB SOURCE PANE MODPANE PICKER RUNDIR DRIVE CROP"
+
+die() { printf 'pv: %s\n' "$*" >&2; exit 1; }
+log() { printf '%s\n' "$*" >&2; }
+
+load() {
+    [ -f "$CUR/state.env" ] || die "no active run; pv up first"
+    # shellcheck disable=SC1091
+    . "$CUR/state.env"
+    EV="$RUN/evidence"
+}
+
+save_state() {
+    local name
+    for name in $STATE_VARS; do
+        printf '%s=%q\n' "$name" "${!name:-}"
+    done > "$CUR/state.env"
+}
+
+# Everything that talks to the app or core goes through these. The agent's own
+# HC_TERMINAL_* would otherwise make hc treat it as the caller (or, in private mode,
+# reach the person's core).
+app() {
+    if [ "$MODE" = real ]; then
+        env -u HC_TERMINAL_ID -u HC_TERMINAL_SOCKET -u HC_SCOPE -u HC_SESSION -u HERDR_APP_HOME herdr-app "$@"
+    else
+        env -u HC_TERMINAL_ID -u HC_TERMINAL_SOCKET -u HC_SCOPE HERDR_APP_HOME="$APP_HOME" HC_SESSION="$SESSION" herdr-app "$@"
+    fi
+}
+hcx() {
+    if [ "$MODE" = real ]; then
+        env -u HC_TERMINAL_ID -u HC_TERMINAL_SOCKET -u HC_SCOPE -u HC_SESSION hc "$@"
+    else
+        env -u HC_TERMINAL_ID -u HC_TERMINAL_SOCKET -u HC_SCOPE HC_SESSION="$SESSION" hc "$@"
+    fi
+}
+
+json_argv() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$@"; }
+
+screen_text() { hcx read --json --lines 0 "$1" 2>/dev/null | jq -r '.text // ""'; }
+
+wait_for_text() { # terminal text timeout_s
+    local i=0 limit=$(( $3 * 10 ))
+    while [ $i -lt $limit ]; do
+        if screen_text "$1" | grep -qF -- "$2"; then return 0; fi
+        sleep 0.1; i=$((i + 1))
+    done
+    return 1
+}
+
+pane_of() { # terminal -> pane id
+    app ls | jq -r --arg t "$1" '[.. | objects | select(.terminal? == $t) | .pane] | first // ""'
+}
+
+addresses() { hcx ls --json | jq -r '.terminals[].address' | sort; }
+
+is_picker() { [ "$(hcx get --json "$1" 2>/dev/null | jq -r 'select(.state=="live") | .labels.pluck // ""')" = picker ]; }
+
+live_pickers() { # every live terminal labelled pluck=picker (reads each terminal's facts)
+    local t
+    for t in $(addresses); do is_picker "$t" && echo "$t"; done
+    return 0
+}
+
+is_live() { hcx get --json "$1" 2>/dev/null | jq -e 'select(.state=="live")' >/dev/null; }
+
+size_of() { hcx get --json "$1" 2>/dev/null | jq -r '"\(.cols)x\(.rows)"'; }
+
+next_drive() { # action -> sets DRIVE (NN-action)
+    local n
+    n=$(find "$EV" -maxdepth 1 -name '[0-9][0-9]-*' | sed 's#.*/\([0-9][0-9]\)-.*#\1#' | sort -n | tail -1)
+    n=$(( 10#${n:-0} + 1 ))
+    DRIVE=$(printf '%02d-%s' "$n" "$1")
+}
+
+dev_merge() { # json
+    python3 - "$DEVFILE" "$1" <<'EOF'
+import json, sys
+path, patch = sys.argv[1], json.loads(sys.argv[2])
+try:
+    data = json.load(open(path))
+except FileNotFoundError:
+    data = {}
+for k, v in patch.items():
+    if v is None:
+        data.pop(k, None)
+    else:
+        data[k] = v
+json.dump(data, open(path, "w"), indent=1)
+EOF
+}
+
+new_run() {
+    [ -e "$CUR" ] && die "a run is active ($(readlink "$CUR")); pv down first"
+    command -v herdr-app >/dev/null || die "herdr-app not on PATH"
+    command -v jq >/dev/null || die "jq not on PATH"
+    local id
+    id=$(date +%Y%m%d-%H%M%S)
+    RUN="$VROOT/$id"
+    mkdir -p "$RUN/evidence" "$RUN/config" "$RUN/project/.git"
+    ln -sfn "$RUN" "$CUR"
+    EV="$RUN/evidence"
+    SESSION="pv$(echo "$id" | tr -d '-')"
+    ZOOM_DELTA=0
+    pbpaste > "$RUN/clipboard.bak" 2>/dev/null || true
+    cp "$FIXTURES/global-config.toml" "$RUN/config/config.toml"
+    cp "$FIXTURES/project-config.toml" "$RUN/project/.herdr-pluck.toml"
+}
+
+cmd_up() {
+    local build=1 real=0 arg
+    for arg in "$@"; do
+        case "$arg" in --no-build) build=0 ;; --real) real=1 ;; *) die "up [--real] [--no-build]" ;; esac
+    done
+    if [ $build = 1 ]; then
+        "$ROOT/scripts/install.sh" >&2
+        (cd "$ROOT" && cargo build --release --example pngdiff >&2)
+    fi
+    new_run
+    if [ $real = 1 ]; then up_real; else up_private; fi
+    save_state
+    sleep 1
+    cmd_doctor
+}
+
+up_real() {
+    MODE=real
+    APP_HOME="$REAL_HOME"
+    MODNAME="$DEV_MOD"
+    DEVFILE="$RUN/dev.json"
+    local link="$APP_HOME/mods/$DEV_MOD"
+    if [ -e "$link" ] || [ -L "$link" ]; then
+        [ "$(readlink "$link")" = "$ROOT/mod" ] || die "$link exists and isn't a link to $ROOT/mod; not touching it"
+    else
+        log "ln -s $ROOT/mod $link"
+        ln -s "$ROOT/mod" "$link"
+    fi
+    local status
+    status=$(app status)
+    SPACE=$(echo "$status" | jq -r .space)
+    ORIG_TAB=$(echo "$status" | jq -r .tab)
+    save_state
+    dev_merge "{\"dry_run_open\": true, \"keep_run_dirs\": true, \"capture_out\": true, \"config\": \"$RUN/config/config.toml\"}"
+    log "Real window: space $SPACE, will restore tab $ORIG_TAB"
+}
+
+up_private() {
+    MODE=private
+    MODNAME=pluck
+    APP_HOME=$(mktemp -d "$TMP_BASE/hapv.XXXXXX")
+    DEVFILE="$APP_HOME/pluck-dev.json"
+    save_state
+    mkdir -p "$APP_HOME/layouts" "$APP_HOME/mods"
+    cat > "$APP_HOME/layouts/pluck.json" <<'EOF'
+{ "id": "root", "type": "row", "children": [
+  { "id": "main", "type": "block", "content": { "tab": "active" } },
+  { "id": "pluck", "type": "block", "content": { "mod": "pluck" }, "size": { "px": 0 } } ] }
+EOF
+    echo '{ "global": { "cmd-shift-f": "pluck.copy", "cmd-shift-u": "pluck.open" } }' > "$APP_HOME/keys.json"
+    echo '{ "telemetry": false }' > "$APP_HOME/settings.json"
+    echo '{ "frame.welcomed": "finished", "layout": "pluck" }' > "$APP_HOME/shared.json"
+    # The person's record of release notes already presented, so "What's new" stays shut.
+    if [ -f "$REAL_HOME/update-notes.json" ]; then cp "$REAL_HOME/update-notes.json" "$APP_HOME/update-notes.json"; fi
+    ln -s "$ROOT/mod" "$APP_HOME/mods/pluck"
+    dev_merge "{\"dry_run_open\": true, \"keep_run_dirs\": true, \"capture_out\": true, \"config\": \"$RUN/config/config.toml\"}"
+    log "Starting private window (HERDR_APP_HOME=$APP_HOME, HC_SESSION=$SESSION)"
+    (cd / && env -u HC_TERMINAL_ID -u HC_TERMINAL_SOCKET -u HC_SCOPE \
+        HERDR_APP_HOME="$APP_HOME" HC_SESSION="$SESSION" DO_NOT_TRACK=1 HERDR_TELEMETRY=0 \
+        nohup herdr-app > "$RUN/app.out" 2>&1 < /dev/null &) > /dev/null 2>&1 < /dev/null
+    local i=0
+    until app status >/dev/null 2>&1; do
+        sleep 0.5; i=$((i + 1)); [ $i -lt 60 ] || die "private window didn't come up; see $RUN/app.out"
+    done
+    app do layout.switch --name pluck >/dev/null
+    SPACE=$(app do space.new --name verify --folder "$RUN/project" | jq -r .space)
+}
+
+cmd_doctor() {
+    load
+    local fail=0 status
+    ok() { printf 'ok    %s\n' "$*"; }
+    bad() { printf 'FAIL  %s\n' "$*"; fail=1; }
+    if status=$(app status 2>/dev/null); then ok "window reachable ($MODE: $APP_HOME)"; else bad "window unreachable"; status='{}'; fi
+    [ "$(echo "$status" | jq -r '.errors | length')" = 0 ] && ok "no status errors" || bad "status errors: $(echo "$status" | jq -c .errors)"
+    [ "$(readlink "$APP_HOME/mods/$MODNAME")" = "$ROOT/mod" ] && ok "mods/$MODNAME is this checkout's mod/" || bad "mods/$MODNAME -> $(readlink "$APP_HOME/mods/$MODNAME")"
+    if herdr-app check "$ROOT/mod" >/dev/null 2>&1; then ok "herdr-app check mod passes"; else bad "herdr-app check mod fails"; fi
+    if cmp -s "$ROOT/mod/bin/herdr-app-pluck" "$ROOT/target/release/herdr-app-pluck"; then ok "mod/bin binary == target/release"; else bad "mod/bin binary differs from target/release (run scripts/install.sh)"; fi
+    if [ "$MODE" = private ]; then
+        [ "$(echo "$status" | jq -r .layout)" = pluck ] && ok "layout pluck (0px pluck block) shown" || bad "layout is $(echo "$status" | jq -r .layout)"
+        local mine theirs
+        mine=$(jq -r .id "$HOME/.local/state/herdr-core/$SESSION/core.json" 2>/dev/null || echo missing)
+        theirs=$(jq -r .id "$HOME/.local/state/herdr-core/default/core.json" 2>/dev/null || echo none)
+        [ "$mine" != missing ] && [ "$mine" != "$theirs" ] \
+            && ok "private core session $SESSION (core $mine, not the person's)" || bad "core session not private ($mine)"
+    elif [ -n "$MODPANE" ]; then
+        # herdr-app ls lists terminal panes only; the mod pane's id comes from pane.split.
+        ok "$DEV_MOD mod pane $MODPANE in the test tab"
+    fi
+    if [ -n "$SOURCE" ]; then
+        [ "$(echo "$status" | jq -r .tab)" = "$TAB" ] && ok "test tab $TAB shown" || bad "shown tab is $(echo "$status" | jq -r .tab), test tab is $TAB"
+        [ "$(echo "$status" | jq -r .focused_pane)" = "$PANE" ] && ok "source pane $PANE ($SOURCE) focused" || bad "focused pane is $(echo "$status" | jq -r .focused_pane), source is $PANE"
+    fi
+    if [ -n "$PICKER" ] && is_live "$PICKER"; then bad "picker $PICKER still running"; else ok "no picker from this run running"; fi
+    return $fail
+}
+
+# The mod pane that puts this checkout's mod in the shown layout (real mode).
+add_mod_pane() {
+    local props
+    props=$(jq -cn --arg b "$ROOT/mod/bin/herdr-app-pluck" --arg d "$DEVFILE" '{binary: $b, devFile: $d}')
+    MODPANE=$(app do pane.split --direction right --pane "$PANE" --mod "$DEV_MOD" --props "$props" | jq -r .pane)
+    [ -n "$MODPANE" ] && [ "$MODPANE" != null ] || die "could not add the $DEV_MOD mod pane"
+    log "mod pane $MODPANE ($DEV_MOD) in the test tab"
+}
+
+# seed <fixture> | seed --cmd argv... ; optional --wait TEXT (default end-of-fixture)
+cmd_seed() {
+    load
+    local wait_text="end-of-fixture" argv
+    if [ "${1:-}" = --cmd ]; then
+        shift
+        local args=()
+        while [ $# -gt 0 ] && [ "$1" != --wait ]; do args+=("$1"); shift; done
+        [ "${1:-}" = --wait ] && wait_text="$2"
+        argv=$(json_argv "${args[@]}")
+    else
+        local fixture="$FIXTURES/${1:?fixture name}"
+        [ -f "$fixture" ] || die "no fixture $fixture"
+        [ "${2:-}" = --wait ] && wait_text="$3"
+        argv=$(json_argv "$FIXTURES/run.sh" "$fixture")
+    fi
+    close_test_tab
+    local made
+    made=$(app do tab.new --space "$SPACE" --name pluck-test --folder "$RUN/project" --argv "$argv")
+    TAB=$(echo "$made" | jq -r .tab)
+    SOURCE=$(echo "$made" | jq -r .terminal)
+    sleep 0.5
+    PANE=$(pane_of "$SOURCE")
+    MODPANE=""
+    save_state
+    if [ "$MODE" = real ]; then add_mod_pane; save_state; fi
+    wait_for_text "$SOURCE" "$wait_text" 15 || die "fixture never printed '$wait_text'"
+    app do pane.focus --pane "$PANE" >/dev/null
+    CROP=""
+    save_state
+    sleep 0.5
+    log "source $SOURCE in pane $PANE ($(size_of "$SOURCE"))"
+}
+
+close_test_tab() {
+    if [ -n "${TAB:-}" ]; then
+        log "closing test tab $TAB"
+        app do tab.close --id "$TAB" --confirmed true >/dev/null 2>&1 || true
+        TAB=""; SOURCE=""; PANE=""; MODPANE=""
+        save_state
+    fi
+}
+
+cmd_split() {
+    load
+    local fixture="$FIXTURES/${1:?fixture}" dir="${2:-right}" made
+    made=$(app do pane.split --direction "$dir" --pane "$PANE" --argv "$(json_argv "$FIXTURES/run.sh" "$fixture")")
+    SOURCE=$(echo "$made" | jq -r .terminal)
+    PANE=$(echo "$made" | jq -r .pane)
+    CROP=""
+    save_state
+    wait_for_text "$SOURCE" end-of-fixture 15 || die "split fixture never finished"
+    app do pane.focus --pane "$PANE" >/dev/null
+    sleep 0.5
+    log "source $SOURCE in pane $PANE ($(size_of "$SOURCE"))"
+}
+
+cmd_zoom() {
+    load
+    # A zoomed pane hides the rest of the tab, and with it the pluck-dev mod pane, and
+    # key commands only reach shown mods.
+    [ "$MODE" = private ] || die "zoom needs the private window (the mod pane would be hidden)"
+    app do pane.zoom --pane "$PANE" >/dev/null; CROP=""; save_state; sleep 0.7
+    log "source size $(size_of "$SOURCE")"
+}
+
+cmd_appzoom() {
+    load
+    case "${1:?in|out|reset}" in
+        in) app do app.zoom_in >/dev/null; ZOOM_DELTA=$((ZOOM_DELTA + 1)) ;;
+        out) app do app.zoom_out >/dev/null; ZOOM_DELTA=$((ZOOM_DELTA - 1)) ;;
+        reset) restore_zoom ;;
+        *) die "in|out|reset" ;;
+    esac
+    CROP=""; save_state
+    sleep 1
+    log "source size $(size_of "$SOURCE")"
+}
+
+restore_zoom() { # undo our zoom steps exactly (the person may not be at zoom 1)
+    while [ "${ZOOM_DELTA:-0}" -gt 0 ]; do app do app.zoom_out >/dev/null; ZOOM_DELTA=$((ZOOM_DELTA - 1)); done
+    while [ "${ZOOM_DELTA:-0}" -lt 0 ]; do app do app.zoom_in >/dev/null; ZOOM_DELTA=$((ZOOM_DELTA + 1)); done
+    save_state
+}
+
+cmd_config() { load; cp "$FIXTURES/${1:?fixture.toml}" "$RUN/config/config.toml"; log "picker config = $1"; }
+
+cmd_dev() { load; dev_merge "${1:?json}"; cat "$DEVFILE"; }
+
+newest_rundir_since() { # marker file
+    find "$TMP_BASE/herdr-app-pluck" -mindepth 1 -maxdepth 1 -type d -newer "$1" 2>/dev/null | head -1
+}
+
+# Shows a solid magenta terminal in the source pane and finds it in a screenshot: the
+# pane's cell area, for cropping pixel diffs.
+cmd_calibrate() {
+    load
+    local want cal i=0 bbox
+    want=$(size_of "$SOURCE")
+    cal=$(hcx run --bg --json --rm --no-parent --no-notify --label pluck=calibrate -- \
+        sh -c 'printf "\033[?25l\033[48;2;255;0;255m\033[2J"; while :; do sleep 0.2; printf "\033[48;2;255;0;255m\033[2J"; done' | jq -r .address)
+    while [ $i -lt 40 ]; do
+        app do terminal.show --terminal "$cal" --pane "$PANE" >/dev/null 2>&1 || true
+        sleep 0.25
+        [ "$(size_of "$cal")" = "$want" ] && break
+        i=$((i + 1))
+    done
+    sleep 0.6
+    app shot "$RUN/calibrate.png" >/dev/null
+    hcx kill "$cal" >/dev/null 2>&1 || true
+    bbox=$("$PNGDIFF" --find ff00ff "$RUN/calibrate.png" | jq -r '.bbox | if . == null then "" else map(tostring) | join(",") end')
+    [ -n "$bbox" ] || die "calibration found no magenta pane (is the window drawing?)"
+    CROP="$bbox"
+    save_state
+    sleep 0.5
+    app do pane.focus --pane "$PANE" >/dev/null
+    log "pane $PANE cell area in screenshots: $CROP"
+}
+
+cmd_invoke() {
+    load
+    local action="${1:?copy|open}"
+    next_drive "$action"
+    local p="$EV/$DRIVE"
+    if [ -n "$PICKER" ] && is_live "$PICKER"; then die "picker $PICKER is still running"; fi
+    app do pane.focus --pane "$PANE" >/dev/null
+    sleep 0.2
+    hcx read --json --lines 0 "$SOURCE" > "$p.source.json"
+    size_of "$SOURCE" > "$p.source-size.txt"
+    app shot "$p.before.png" >/dev/null
+    addresses > "$RUN/.before-addresses"
+    local marker="$RUN/.mark"
+    touch "$marker"; sleep 0.05
+    app do "$MODNAME.$action" > "$p.do.json"
+    PICKER=""; RUNDIR=""
+    local i=0 want t
+    want=$(size_of "$SOURCE")
+    while [ $i -lt 100 ]; do
+        [ -n "$RUNDIR" ] || RUNDIR=$(newest_rundir_since "$marker")
+        if [ -z "$PICKER" ]; then
+            for t in $(addresses | comm -13 "$RUN/.before-addresses" -); do
+                if is_picker "$t"; then PICKER="$t"; fi
+            done
+        fi
+        if [ -n "$PICKER" ] && [ "$(size_of "$PICKER")" = "$want" ] && [ -n "$(screen_text "$PICKER")" ]; then break; fi
+        if [ -n "$RUNDIR" ] && [ -f "$RUNDIR/result.json" ]; then break; fi
+        sleep 0.1; i=$((i + 1))
+    done
+    if [ -n "$RUNDIR" ]; then echo "$RUNDIR" >> "$RUN/rundirs.txt"; fi
+    save_state
+    if [ -n "$PICKER" ] && is_live "$PICKER" && [ "$(size_of "$PICKER")" = "$want" ]; then
+        sleep 0.5 # let the app draw the shown terminal
+        hcx read --json --lines 0 "$PICKER" > "$p.picker.json"
+        size_of "$PICKER" > "$p.picker-size.txt"
+        app shot "$p.picker.png" >/dev/null
+        log "$DRIVE: picker $PICKER shown at $want in $PANE"
+        screen_text "$PICKER"
+    else
+        sleep 1
+        collect_after "$p"
+        log "$DRIVE: no picker shown"
+        cat "$p.result.json" 2>/dev/null || true
+    fi
+}
+
+collect_after() { # prefix
+    local p="$1"
+    if [ -n "$RUNDIR" ]; then
+        if [ -f "$RUNDIR/result.json" ]; then cp "$RUNDIR/result.json" "$p.result.json"; fi
+        if [ -f "$RUNDIR/opened.txt" ]; then cp "$RUNDIR/opened.txt" "$p.opened.txt"; fi
+        if [ -f "$RUNDIR/capture.bin" ]; then cp "$RUNDIR/capture.bin" "$p.capture.bin"; fi
+    fi
+    pbpaste > "$p.clipboard" 2>/dev/null || true
+    app status > "$p.status.json" 2>/dev/null || true
+    app shot "$p.after.png" >/dev/null 2>&1 || true
+}
+
+cmd_select() {
+    load
+    [ -n "$PICKER" ] || die "no picker from the last invoke"
+    local p="$EV/$DRIVE"
+    printf '%s\n' "$*" >> "$p.keys.txt"
+    hcx keys "$PICKER" "$@" >/dev/null
+    local i=0
+    while [ $i -lt 30 ]; do
+        is_live "$PICKER" || break
+        sleep 0.1; i=$((i + 1))
+    done
+    if is_live "$PICKER"; then
+        local k
+        k=$(wc -l < "$p.keys.txt" | tr -d ' ')
+        sleep 0.4
+        hcx read --json --lines 0 "$PICKER" > "$p.after-keys-$k.picker.json"
+        app shot "$p.after-keys-$k.png" >/dev/null
+        log "$DRIVE: picker still open after: $*"
+        screen_text "$PICKER"
+        return 0
+    fi
+    sleep 0.8 # the mod copies/opens and toasts
+    collect_after "$p"
+    PICKER=""
+    save_state
+    log "$DRIVE: picker closed"
+    printf 'result:    %s\n' "$(cat "$p.result.json" 2>/dev/null || echo '<none>')"
+    printf 'clipboard: %s\n' "$(cat "$p.clipboard")"
+    if [ -f "$p.opened.txt" ]; then printf 'opened:    %s\n' "$(cat "$p.opened.txt")"; fi
+    printf 'focused:   %s (source pane %s)\n' "$(jq -r .focused_pane "$p.status.json")" "$PANE"
+}
+
+cmd_shot() { load; app shot "$EV/${1:?name}.png"; }
+cmd_status() { load; app status; }
+
+# Text check: picker screen equals the source screen; with --hints, differs only where a
+# hint letter replaced a character (same row lengths, so nothing moved).
+text_check() { # source.json picker.json mode
+    python3 - "$1" "$2" "$3" <<'EOF'
+import json, sys
+src = json.load(open(sys.argv[1]))["text"].split("\n")
+pick = json.load(open(sys.argv[2]))["text"].split("\n")
+mode = sys.argv[3]
+alphabet = set("asdfghjklqwertyuiopzxcvbnm")
+problems, replaced = [], 0
+if len(src) != len(pick):
+    problems.append(f"row count {len(src)} vs {len(pick)}")
+for i, (a, b) in enumerate(zip(src, pick)):
+    if a == b:
+        continue
+    if mode != "hints" or len(a) != len(b):
+        problems.append(f"row {i}: {a!r} vs {b!r}")
+        continue
+    for j, (x, y) in enumerate(zip(a, b)):
+        if x != y:
+            if y in alphabet:
+                replaced += 1
+            else:
+                problems.append(f"row {i} col {j}: {x!r} -> {y!r}")
+print(json.dumps({"ok": not problems, "rows": len(src), "hint_cells": replaced, "problems": problems[:20]}))
+sys.exit(0 if not problems else 1)
+EOF
+}
+
+cmd_exact() {
+    load
+    local dim=0 hints=0 seedargs=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dim) dim=1 ;;
+            --hints) hints=1 ;;
+            --cmd) shift; seedargs=(--cmd "$@"); break ;;
+            *) seedargs=("$1") ;;
+        esac
+        shift
+    done
+    [ ${#seedargs[@]} -gt 0 ] || die "exact <fixture> | exact KEEP | exact --cmd argv..."
+    [ -x "$PNGDIFF" ] || die "build pngdiff: cargo build --release --example pngdiff"
+    if [ "${seedargs[0]}" != KEEP ]; then cmd_seed "${seedargs[@]}"; load; fi
+    [ -n "$CROP" ] || { cmd_calibrate; load; }
+    local nodim=true nohints=true
+    [ $dim = 1 ] && nodim=null
+    [ $hints = 1 ] && nohints=null
+    dev_merge "{\"no_dim\": $nodim, \"no_hints\": $nohints}"
+    cmd_invoke copy > /dev/null
+    load
+    local p="$EV/$DRIVE" verdict=PASS text pixels tmode=exact
+    [ $hints = 1 ] && tmode=hints
+    if [ ! -f "$p.picker.json" ]; then
+        verdict=FAIL; text='{"ok":false,"problems":["no picker"]}'; pixels='{}'
+    else
+        text=$(text_check "$p.source.json" "$p.picker.json" "$tmode") || verdict=FAIL
+        if [ $dim = 1 ]; then
+            pixels=$("$PNGDIFF" "$p.before.png" "$p.picker.png" --glyphs --crop "$CROP")
+        else
+            pixels=$("$PNGDIFF" "$p.before.png" "$p.picker.png" --crop "$CROP")
+        fi
+        # Exact pixels without dim or hints; glyph shapes (1 px antialias tolerance) with dim.
+        if [ $hints = 0 ] && [ "$(echo "$pixels" | jq -r .diff_pixels)" != 0 ]; then verdict=FAIL; fi
+        hcx keys "$PICKER" esc >/dev/null 2>&1 || true
+        sleep 0.8
+    fi
+    dev_merge '{"no_dim": null, "no_hints": null}'
+    PICKER=""; save_state
+    printf '{"verdict":"%s","dim":%s,"hints":%s,"source_size":"%s","text":%s,"pixels":%s}\n' \
+        "$verdict" "$dim" "$hints" "$(cat "$p.source-size.txt")" "$text" "$pixels" | tee "$p.exact.json"
+    [ $verdict = PASS ]
+}
+
+remove_rundirs() {
+    if [ -f "$RUN/rundirs.txt" ]; then
+        local d
+        sort -u "$RUN/rundirs.txt" | while read -r d; do
+            case "$d" in "$TMP_BASE"/herdr-app-pluck/*) if [ -d "$d" ]; then log "rm -r $d"; rm -r "$d"; fi ;; esac
+        done
+    fi
+}
+
+cmd_down() {
+    load
+    if [ -n "$PICKER" ] && is_live "$PICKER"; then log "killing picker $PICKER"; hcx kill "$PICKER" >/dev/null 2>&1 || true; fi
+    if [ "$MODE" = real ]; then
+        restore_zoom
+        close_test_tab
+        if [ -n "$ORIG_TAB" ]; then app do tab.select --id "$ORIG_TAB" >/dev/null 2>&1 || true; fi
+        local link="$APP_HOME/mods/$DEV_MOD"
+        if [ -L "$link" ] && [ "$(readlink "$link")" = "$ROOT/mod" ]; then log "rm $link (link)"; rm "$link"; fi
+        log "Restoring the clipboard"
+        pbcopy < "$RUN/clipboard.bak" 2>/dev/null || true
+    else
+        cp "$RUN/app.out" "$EV/app.out" 2>/dev/null || true
+        log "Quitting the private window"
+        app do app.quit >/dev/null 2>&1 || true
+        sleep 2
+        log "Ending terminals in private core session $SESSION"
+        local t
+        for t in $(hcx ls --json 2>/dev/null | jq -r '.terminals[].address'); do
+            hcx keep "$t" --off >/dev/null 2>&1 || true
+            hcx kill "$t" >/dev/null 2>&1 || true
+            hcx rm "$t" >/dev/null 2>&1 || true
+        done
+        hcx server stop >/dev/null 2>&1 || true
+        # Never `hc server status` here: it starts the core again.
+        log "Restoring the clipboard"
+        pbcopy < "$RUN/clipboard.bak" 2>/dev/null || true
+        local state_dir="$HOME/.local/state/herdr-core/$SESSION"
+        case "$SESSION" in pv[0-9]*) ;; *) die "unexpected session name $SESSION; not deleting" ;; esac
+        if [ -d "$state_dir" ]; then log "rm -r $state_dir"; rm -r "$state_dir"; fi
+        case "$APP_HOME" in "$TMP_BASE"/hapv.*) log "rm -r $APP_HOME"; rm -r "$APP_HOME" ;; *) log "not deleting unexpected home $APP_HOME" ;; esac
+    fi
+    remove_rundirs
+    log "rm $CUR (link; the run folder stays)"
+    rm "$CUR"
+    log "Evidence: $RUN/evidence"
+}
+
+case "${1:-}" in
+    up) shift; cmd_up "$@" ;;
+    doctor) cmd_doctor ;;
+    seed) shift; cmd_seed "$@" ;;
+    split) shift; cmd_split "$@" ;;
+    zoom) cmd_zoom ;;
+    appzoom) shift; cmd_appzoom "$@" ;;
+    config) shift; cmd_config "$@" ;;
+    dev) shift; cmd_dev "$@" ;;
+    calibrate) cmd_calibrate ;;
+    invoke) shift; cmd_invoke "$@" ;;
+    select) shift; cmd_select "$@" ;;
+    exact) shift; cmd_exact "$@" ;;
+    shot) shift; cmd_shot "$@" ;;
+    status) cmd_status ;;
+    down) cmd_down ;;
+    ""|-h|--help) sed -n '2,28p' "$0" ;;
+    *) die "unknown command $1 (pv --help)" ;;
+esac
