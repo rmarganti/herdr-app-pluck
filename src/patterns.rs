@@ -129,13 +129,13 @@ fn built_in_patterns() -> &'static [PatternDefinition] {
                 10,
                 r#"(((?i:https?://|git@|git://|ssh://|ftp://|file://))[^\s()"']+)"#,
             ),
-            PatternDefinition::compile("git-status", 15, r#"(modified|deleted|deleted by us|new file): +(?<match>.+)"#),
+            PatternDefinition::compile("git-status", 15, r#"(modified|deleted|deleted by us|new file): +(?<match>\S(?:.*\S)?)"#),
             PatternDefinition::compile(
                 "git-status-branch",
                 15,
                 r#"Your branch is up to date with '(?<match>.*)'\."#,
             ),
-            PatternDefinition::compile("diff", 15, r#"(---|\+\+\+) [ab]/(?<match>.*)"#),
+            PatternDefinition::compile("diff", 15, r#"(---|\+\+\+) [ab]/(?<match>\S(?:.*\S)?)"#),
             PatternDefinition::compile(
                 "kubernetes",
                 18,
