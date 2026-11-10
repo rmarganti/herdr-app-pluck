@@ -22,6 +22,7 @@ went through the layout's own `pluck` copy.
 | Journey | Drive | Proof | Status |
 |---|---|---|---|
 | copy, 1-letter hint | `seed tokens.txt; invoke copy; select d` | `picker.json` hints; clipboard `src/picker/session.rs`; result picked/copy; toast "Copied …"; pane restored (`after.png`) | ✅ 233055 #02 |
+| Git paths exclude terminal padding | Seed `modified:   dots/.bash_aliases` and `+++ b/docs/my notes.md`; `invoke copy; select a`, then `invoke copy; select s`; `exact KEEP` | clipboard and result contain exactly each path, preserving internal spaces; screenshot inspected; exact replay has 0 differing pixels | ✅ private run `20261110-094333` #01–03 |
 | copy, 2-letter hints | `seed many.txt; invoke copy; select s; select a` | all hints 2 letters; after `s` only `s?` remain, others restored (`after-keys-1`); clipboard `10.0.0.27` | ✅ #06 |
 | backspace | `invoke copy; select s; select backspace` | `after-keys-2.picker.json` text == `picker.json` text | ✅ #07 |
 | cancel (Esc, Ctrl-C) | `select esc` / `select ctrl+c` | result cancelled; clipboard sentinel unchanged; picker gone | ✅ #07, #08 |

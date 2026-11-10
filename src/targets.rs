@@ -134,6 +134,29 @@ mod tests {
     }
 
     #[test]
+    fn git_paths_exclude_terminal_padding() {
+        for (prefix, pattern) in [
+            ("modified:   ", "git-status"),
+            ("new file:   ", "git-status"),
+            ("deleted by us: ", "git-status"),
+            ("--- a/", "diff"),
+            ("+++ b/", "diff"),
+        ] {
+            for path in ["dots/.bash_aliases", "docs/my notes.md"] {
+                let paint = format!("{prefix}{path}\t  ");
+                let grid = decode(paint.as_bytes(), 100, 1).unwrap();
+                let targets = find_targets(&grid, Action::Copy, &[]);
+                assert_eq!(texts(&targets), vec![("a".into(), path.into())]);
+                let span = &targets.assignments.assignments()[0].occurrences[0];
+                assert_eq!(span.pattern, pattern);
+                assert_eq!(span.start, prefix.len());
+                assert_eq!(span.end, prefix.len() + path.len());
+                assert_eq!(targets.cells(span).len(), path.len());
+            }
+        }
+    }
+
+    #[test]
     fn open_only_hints_openable_urls() {
         let grid = decode(b"src/main.rs https://x.test ssh://h/p file:///tmp/a", 60, 1).unwrap();
         let targets = find_targets(&grid, Action::Open, &[]);
